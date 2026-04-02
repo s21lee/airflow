@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from kubernetes.client import ApiClient, models as k8s
 
 from airflow.exceptions import AirflowException
@@ -70,18 +72,68 @@ def convert_port(port) -> k8s.V1ContainerPort:
     return _convert_kube_model_object(port, k8s.V1ContainerPort)
 
 
-def convert_env_vars(env_vars: list[k8s.V1EnvVar] | dict[str, str]) -> list[k8s.V1EnvVar]:
+def _env_var_dict_to_v1(item: dict[str, Any], idx: int) -> k8s.V1EnvVar:
+    """Build ``V1EnvVar`` from a dict (simple name/value or Kubernetes client dict)."""
+    name = item.get("name")
+    if isinstance(name, str) and name and "value" in item:
+        return k8s.V1EnvVar(name=name, value=item["value"])
+    if "name" in item and not isinstance(item["name"], str):
+        raise AirflowException(
+            f"Invalid env_vars[{idx}]: `name` must be a string, got {type(item['name']).__name__}."
+        )
+    try:
+        obj = _convert_from_dict(item, k8s.V1EnvVar)
+    except AirflowException as e:
+        raise AirflowException(
+            f"Invalid env_vars[{idx}]: expected a dict with non-empty string 'name' and a "
+            f"'value' key, or a Kubernetes V1EnvVar-compatible dict. {e}"
+        ) from e
+    except (TypeError, ValueError) as e:
+        raise AirflowException(
+            f"Invalid env_vars[{idx}]: could not build V1EnvVar from dict. {e}"
+        ) from e
+    if obj.value is None and obj.value_from is None:
+        raise AirflowException(
+            f"Invalid env_vars[{idx}]: env var must set `value`, `valueFrom`/`value_from`, "
+            "or use non-empty string `name` with a `value` key for plain literals."
+        )
+    if not isinstance(obj.name, str) or not obj.name:
+        raise AirflowException(
+            f"Invalid env_vars[{idx}]: `name` must be a non-empty string."
+        )
+    return obj
+
+
+def convert_env_vars(
+    env_vars: list[k8s.V1EnvVar] | list[dict[str, Any]] | dict[str, str],
+) -> list[k8s.V1EnvVar]:
     """
     Coerce env var collection for kubernetes.
 
-    If the collection is a str-str dict, convert it into a list of ``V1EnvVar`` variables.
+    * If the collection is a str-str dict, convert it into a list of ``V1EnvVar`` variables.
+    * If it is a list of dicts (legacy ``name`` / ``value`` entries or K8s-shaped dicts), convert each.
+    * If it is a list of ``V1EnvVar``, return it unchanged.
     """
     if isinstance(env_vars, dict):
         return [k8s.V1EnvVar(name=k, value=v) for k, v in env_vars.items()]
-    return env_vars
+    if not isinstance(env_vars, list):
+        return env_vars  # type: ignore[return-value]
+    if not env_vars:
+        return []
+    all_v1 = all(isinstance(x, k8s.V1EnvVar) for x in env_vars)
+    all_dict = all(isinstance(x, dict) for x in env_vars)
+    if all_v1:
+        return env_vars
+    if all_dict:
+        return [_env_var_dict_to_v1(d, i) for i, d in enumerate(env_vars)]
+    raise AirflowException(
+        "env_vars list must contain only V1EnvVar instances or only dicts, not a mixture of types."
+    )
 
 
-def convert_env_vars_or_raise_error(env_vars: list[k8s.V1EnvVar] | dict[str, str]) -> list[k8s.V1EnvVar]:
+def convert_env_vars_or_raise_error(
+    env_vars: list[k8s.V1EnvVar] | list[dict[str, Any]] | dict[str, str],
+) -> list[k8s.V1EnvVar]:
     """
     Separate function to convert env var collection for kubernetes and then raise an error if it is still the wrong type.
 
